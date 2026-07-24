@@ -23,7 +23,7 @@ Contract.make {
             contentType(applicationJson())
         }
         body(
-                message: "Hello"
+                message: "Hello Team"
         )
     }
 }
