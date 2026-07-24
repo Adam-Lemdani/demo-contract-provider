@@ -36,22 +36,28 @@ sequenceDiagram
     autonumber
     actor Dev as Developer
     participant PP as Provider PR
-    participant PW as Provider Actions
-    participant CW as Consumer Actions (receiver)
+    participant D as discover job
+    participant M as verify matrix (parallel, 1 job / consumer)
+    participant R as report job
     participant GH as GitHub API
 
     Dev->>PP: Open / update PR
-    PP->>PW: pr-build.yml (own build + contract verify)
-    PP->>PW: dispatch-to-consumers.yml
-    PW->>GH: Read pom coords, Code Search + confirm consumer pom
-    PW->>CW: repository_dispatch verify-provider-change {provider_sha}
-    Note over CW: One job checks out BOTH repos
-    CW->>CW: checkout consumer default + provider@SHA
-    CW->>CW: mvn install provider -> runner-local .m2 (stubs)
-    CW->>CW: mvn test consumer (StubsMode.LOCAL)
-    CW->>GH: commit status + summary comment on Provider PR
+    PP->>D: cross-repo-verify.yml
+    D->>GH: Read pom coords, Code Search + confirm each consumer pom
+    D-->>M: matrix = [confirmed consumers]
+    par one job per consumer (fail-fast:false, max-parallel:10)
+        M->>M: checkout provider@SHA (depth 1) + consumer@default (depth 1)
+        M->>M: mvn install provider -> runner-local .m2 (stubs)
+        M->>M: mvn test consumer (StubsMode.LOCAL)
+        M->>R: upload result artifact (pass/fail + job link)
+    end
+    R->>GH: single commit status + one summary comment listing breaking repos
     GH-->>PP: ✅/❌ required status check
 ```
+
+> Fan-out, not a single mega-job: each matrix job checks out only **two** repos
+> (provider@SHA + one consumer) with `fetch-depth: 1`, so wall-clock time is
+> roughly one build long regardless of consumer count (bounded by `max-parallel`).
 
 ## Local test instructions
 
@@ -89,11 +95,17 @@ Restore the field to return to green.
 | File | Trigger | Purpose |
 |------|---------|---------|
 | `pr-build.yml` | `pull_request`, `workflow_dispatch` | Own build + contract verification; installs stubs into runner-local `.m2`. |
-| `dispatch-to-consumers.yml` | `pull_request`, `workflow_dispatch` | Discover consumers of the provider coords and dispatch verification. |
-| `verify-consumer-change.yml` | `repository_dispatch: verify-consumer-change`, `workflow_dispatch` | Receiver for the **consumer PR flow**: build provider stubs locally, run the changed consumer's tests, report to consumer PR. |
+| `cross-repo-verify.yml` | `pull_request`, `workflow_dispatch` | `discover` downstream consumers → `verify` matrix (parallel, one job per consumer, each runs that consumer's tests against provider@SHA stubs) → `report` single status + summary comment. |
 
-`workflow_dispatch` inputs on the receiver let you replay any verification
-manually for demos/troubleshooting.
+`cross-repo-verify.yml` accepts a `workflow_dispatch` input (`consumer_repo`) to
+verify a single consumer manually for demos/troubleshooting.
+
+> **Alternative (cross-org / partner-owned):** if verification must execute in
+> the consumer's own repo instead of in-repo, replace the matrix with a
+> `repository_dispatch` to the consumer (payload = provider SHA) and a receiver
+> workflow on the consumer's default branch. Same steps, extra hop; needs
+> `Contents: write` to create the dispatch. The in-repo matrix above is used
+> here because it is faster and self-contained for the demo.
 
 ## GitHub App / PAT setup
 
@@ -105,24 +117,25 @@ Production design uses a **GitHub App** installed on both repos. A fine-grained
 | Scope | Access | Why |
 |-------|--------|-----|
 | **Metadata** | Read | Always required. |
-| **Contents** | Read + write | `Contents: write` is required to create a `repository_dispatch` event; read is required to check out code. |
-| **Commit statuses** | Read + write | Post the branch-protection status check. |
-| **Pull requests** | Read + write | Create/update the single summary comment. |
+| **Contents** | Read (both repos) | Check out this repo + the partner repo (private) in the matrix. `Contents: write` is only needed for the `repository_dispatch` alternative described above. |
+| **Commit statuses** | Read + write | Post the single branch-protection status check. |
+| **Pull requests** | Read + write | Create/update the one summary comment. |
 | **Checks** | Write | Only if you switch reporting to Check Runs instead of commit statuses. |
 
-> Verified: *Create a repository dispatch event* requires `Contents: write` for
+> Verified: the `repository_dispatch` alternative requires `Contents: write` for
 > fine-grained tokens / GitHub Apps
 > (https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event).
-> Confirm the others against the current REST docs before enabling in production.
+> The in-repo matrix used here needs only `Contents: read` on both repos plus
+> statuses/PR write. Confirm against current REST docs before enabling in production.
 
 ### Repository variables and secrets
 
 | Name | Kind | Used by | Notes |
 |------|------|---------|-------|
-| `APP_ID` | Variable | dispatch + receiver | GitHub App id. If empty, PAT fallback is used. |
+| `APP_ID` | Variable | cross-repo-verify | GitHub App id. If empty, PAT fallback is used. |
 | `PARTNER_REPO` | Variable | discovery fallback | `owner/demo-contract-consumer`. Deterministic partner when Code Search is cold. |
-| `APP_PRIVATE_KEY` | Secret | dispatch + receiver | GitHub App private key (PEM). |
-| `DISPATCH_PAT` | Secret | fallback | Fine-grained PAT with the permissions above, demo only. |
+| `APP_PRIVATE_KEY` | Secret | cross-repo-verify | GitHub App private key (PEM). |
+| `DISPATCH_PAT` | Secret | fallback | Fine-grained PAT (Contents: R on both repos, Statuses: W, Pull requests: W, Metadata: R), demo only. |
 
 ## Dependency discovery (and its limits)
 

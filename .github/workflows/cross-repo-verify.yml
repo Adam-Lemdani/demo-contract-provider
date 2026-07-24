@@ -1,0 +1,268 @@
+name: Cross-repo verify (provider PR)
+
+# PROVIDER PR flow, in-repo matrix fan-out.
+#
+#   discover -> verify (matrix, one job per downstream consumer, parallel) -> report
+#
+# For a provider PR we find the DOWNSTREAM consumers (repos whose pom.xml
+# references this provider's coordinates), then in parallel check out each
+# consumer's default branch, build THIS provider's stubs at the exact PR SHA
+# into a runner-local .m2, and run that consumer's real tests against them.
+# A single aggregated status + one summary comment (listing any breaking repos
+# with links to their job) is reported back on the PR.
+#
+# Correctness note: we do NOT merely build the provider; each matrix job runs
+# the consumer's own tests against the provider stubs.
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      consumer_repo:
+        description: 'Verify a single consumer owner/name (manual fallback)'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  # A new PR commit cancels the older verification fan-out.
+  group: cross-repo-verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Never expose credentials to untrusted fork PRs.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      consumers: ${{ steps.find.outputs.consumers }}
+      provider_sha: ${{ steps.ctx.outputs.provider_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Resolve PR SHA and provider coordinates
+        id: ctx
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          GID=$(mvn -q -N help:evaluate -Dexpression=project.groupId -DforceStdout)
+          AID=$(mvn -q -N help:evaluate -Dexpression=project.artifactId -DforceStdout)
+          echo "provider_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "group_id=$GID"     >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$AID"  >> "$GITHUB_OUTPUT"
+          echo "Provider $GID:$AID @ $SHA"
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: vars.APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Discover + confirm downstream consumers
+        id: find
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
+          script: |
+            const groupId = ${{ toJSON(steps.ctx.outputs.group_id) }};
+            const artifactId = ${{ toJSON(steps.ctx.outputs.artifact_id) }};
+
+            const candidates = new Set();
+            const manual = ${{ toJSON(github.event.inputs.consumer_repo) }};
+            if (manual) candidates.add(manual);
+            const configured = ${{ toJSON(vars.PARTNER_REPO) }};
+            if (configured) candidates.add(configured);
+
+            // Downstream discovery: who references our coordinates in a pom.xml.
+            // Code Search is text-based, may lag indexing, and is NOT authoritative.
+            try {
+              const q = `"${artifactId}" in:file filename:pom.xml`;
+              const res = await github.rest.search.code({ q, per_page: 50 });
+              for (const it of res.data.items) candidates.add(it.repository.full_name);
+            } catch (e) { core.warning(`Code Search unavailable: ${e.message}`); }
+
+            // Confirm each candidate by reading its pom.xml for our coordinates.
+            const re = new RegExp(`${groupId}[\\s\\S]{0,80}${artifactId}|<artifactId>\\s*${artifactId}\\s*</artifactId>`);
+            const confirmed = [];
+            for (const full of candidates) {
+              const [owner, repo] = full.split('/');
+              if (!owner || !repo || full === context.repo.owner + '/' + context.repo.repo) continue;
+              try {
+                const pom = await github.rest.repos.getContent({ owner, repo, path: 'pom.xml' });
+                const text = Buffer.from(pom.data.content, 'base64').toString('utf8');
+                if (re.test(text)) confirmed.push(full);
+                else core.info(`Skip ${full}: coordinates not found in pom.xml`);
+              } catch (e) { core.info(`Skip ${full}: ${e.message}`); }
+            }
+            core.info(`Confirmed consumers: ${confirmed.join(', ') || '(none)'}`);
+            core.setOutput('consumers', JSON.stringify(confirmed));
+
+  verify:
+    needs: discover
+    if: needs.discover.outputs.consumers != '[]' && needs.discover.outputs.consumers != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false          # one broken consumer must not hide the others
+      max-parallel: 10          # cap fan-out to stay within runner limits
+      matrix:
+        consumer: ${{ fromJson(needs.discover.outputs.consumers) }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        if: vars.APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            ${{ matrix.consumer }}
+
+      - name: Checkout provider at PR SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.discover.outputs.provider_sha }}
+          fetch-depth: 1
+          path: provider
+
+      - name: Checkout consumer default branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.consumer }}
+          token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
+          fetch-depth: 1
+          path: consumer
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build provider stubs (runner-local .m2) + run consumer tests
+        id: run
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          M2="${{ runner.temp }}/m2"
+          mvn -B -ntp -f provider/pom.xml clean install -Dmaven.repo.local="$M2"
+          PVER=$(mvn -q -N -f provider/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)
+          mvn -B -ntp -f consumer/pom.xml test -Dmaven.repo.local="$M2" -Dprovider.stubs.version="$PVER"
+
+      - name: Record result
+        if: always()
+        run: |
+          mkdir -p results
+          SAFE=$(echo "${{ matrix.consumer }}" | tr '/' '_')
+          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf '{"repo":"%s","outcome":"%s","job_url":"%s"}\n' \
+            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" "$RUN/job/${{ github.job }}" > "results/$SAFE.json"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ strategy.job-index }}
+          path: results/*.json
+          retention-days: 1
+
+  report:
+    needs: [ discover, verify ]
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: result-*
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: vars.APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Aggregate + report on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
+          script: |
+            const fs = require('fs');
+            const sha = ${{ toJSON(needs.discover.outputs.provider_sha) }};
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let results = [];
+            try {
+              for (const f of fs.readdirSync('results')) {
+                if (f.endsWith('.json')) results.push(JSON.parse(fs.readFileSync(`results/${f}`,'utf8')));
+              }
+            } catch (e) { core.info(`No result files: ${e.message}`); }
+
+            const failed = results.filter(r => r.outcome !== 'success');
+            const passed = results.filter(r => r.outcome === 'success');
+            const noConsumers = results.length === 0;
+            const success = failed.length === 0;
+
+            // Single aggregated status for branch protection.
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha,
+              state: success ? 'success' : 'failure',
+              context: 'contract-verification',
+              target_url: runUrl,
+              description: noConsumers ? 'No downstream consumers found'
+                : (success ? `All ${passed.length} consumer(s) pass` : `${failed.length} consumer(s) failing`),
+            });
+
+            if (!context.payload.pull_request) return;
+
+            const marker = '<!-- contract-verification:downstream -->';
+            const line = r => `- ${r.outcome === 'success' ? '✅' : '❌'} \`${r.repo}\` ([job](${r.job_url}))`;
+            let body = `${marker}\n### Contract verification — downstream consumers\n`;
+            if (noConsumers) {
+              body += `No downstream consumers reference this provider. Nothing to verify.\n`;
+            } else if (success) {
+              body += `✅ **All ${passed.length} consumer(s) pass** against provider \`${sha.substring(0,7)}\`.\n\n` +
+                      passed.map(line).join('\n');
+            } else {
+              body += `❌ **Breaking change** — ${failed.length} consumer(s) fail against provider \`${sha.substring(0,7)}\`:\n\n` +
+                      failed.map(line).join('\n') +
+                      (passed.length ? `\n\nPassing:\n` + passed.map(line).join('\n') : '');
+            }
+            body += `\n\n[Verification run](${runUrl})`;
+
+            // Update one existing summary comment instead of spamming on rerun.
+            const pr = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments(
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment(
+              { owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment(
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr, body });
+
+            if (!success) core.setFailed(`${failed.length} consumer(s) failing`);
