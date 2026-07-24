@@ -104,7 +104,9 @@ jobs:
       - name: Open PR if the graph changed
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ github.token }}
+          # App/PAT so the graph PR TRIGGERS contract-verification. A PR opened
+          # with the built-in GITHUB_TOKEN would not start further workflows.
+          token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
           branch: chore/service-graph
           commit-message: "chore: regenerate service graph"
           title: "chore: regenerate service graph"
