@@ -22,6 +22,6 @@ class GreetingControllerTest {
     void returnsGreetingMessage() throws Exception {
         mockMvc.perform(get("/api/greetings/Adam"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.message").value("Hello Adam"));
+                .andExpect(jsonPath("$.message").value("Hell0000000000"));
     }
 }
