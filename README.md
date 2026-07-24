@@ -21,11 +21,11 @@ GET /api/greetings/{name}  ->  200 {"message":"Hello {name}"}
 **Proves:** When a provider PR changes the contract-relevant behaviour (e.g.
 renames the `message` field), an automated GitHub Actions flow builds the exact
 PR commit and runs the **real consumer tests** against the resulting stubs,
-reporting pass/fail back on the PR — with no developer-run Maven commands after
+reporting pass/fail back on the PR - with no developer-run Maven commands after
 the PR is raised, and no artifacts published anywhere.
 
 **Does not prove:** That every consumer everywhere is discovered (discovery is
-best-effort — see below), nor that runtime concerns beyond the contract (auth,
+best-effort - see below), nor that runtime concerns beyond the contract (auth,
 performance, Kafka, etc.) are safe. Installing a JAR and running a build is *not*
 verification; the workflows explicitly run the changed consumer's tests.
 
@@ -79,7 +79,7 @@ Rename the contract-relevant field and watch consumer verification fail:
 1. In `src/main/java/com/example/provider/Greeting.java` rename `message` → `content`.
 2. In `src/test/resources/contracts/greetings/shouldReturnGreeting.groovy` change
    `message:` → `content:` and update the provider's own tests.
-3. `mvn clean install` — stubs now emit `{"content":...}`.
+3. `mvn clean install` - stubs now emit `{"content":...}`.
 4. The consumer's `GreetingClientStubRunnerTest` (which expects `message`) fails.
 
 Restore the field to return to green.
@@ -160,17 +160,3 @@ Discovery is **automated** but **not authoritative**:
 - **No status on PR**: `Commit statuses: write` missing, or the reporting token
   can't see the originating repo.
 
-## Remote setup (run yourself — not done automatically)
-
-```bash
-cd demo-contract-provider
-git init && git add . && git commit -m "Initial provider demo"
-gh repo create demo-contract-provider --private --source=. --remote=origin --push
-# Variables / secrets:
-gh variable set PARTNER_REPO --body "<you>/demo-contract-consumer"
-gh variable set APP_ID       --body "<app-id>"
-gh secret   set APP_PRIVATE_KEY < app-private-key.pem
-# Demo-only PAT fallback:
-gh secret   set DISPATCH_PAT  --body "<fine-grained-pat>"
-# Branch protection: require the 'contract-verification/consumer' status check.
-```
