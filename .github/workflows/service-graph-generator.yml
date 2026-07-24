@@ -1,0 +1,117 @@
+name: Regenerate service graph (provider)
+
+# Tier-3 discovery: nightly regeneration of .github/service-graph.json from
+# authoritative signals, so PR-time discovery is deterministic and auditable
+# rather than depending on live Code Search.
+#
+# What it does:
+#   * downstreamConsumers <- Code Search for repos referencing this provider's
+#     coordinates, CONFIRMED by reading each candidate pom.xml.
+#   * manualOverrides are PRESERVED verbatim (for relationships that cannot be
+#     inferred, e.g. runtime HTTP/Kafka).
+#   * Opens a PR if the graph changed (audited, never a silent push to main).
+
+on:
+  schedule:
+    - cron: '17 3 * * *'      # nightly 03:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: service-graph-provider
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Read provider coordinates
+        id: coords
+        run: |
+          set -euo pipefail
+          GID=$(mvn -q -N help:evaluate -Dexpression=project.groupId -DforceStdout)
+          AID=$(mvn -q -N help:evaluate -Dexpression=project.artifactId -DforceStdout)
+          echo "group_id=$GID"    >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$AID" >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: vars.APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Rebuild downstreamConsumers (confirmed) + preserve overrides
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
+          script: |
+            const fs = require('fs');
+            const path = '.github/service-graph.json';
+            const groupId = ${{ toJSON(steps.coords.outputs.group_id) }};
+            const artifactId = ${{ toJSON(steps.coords.outputs.artifact_id) }};
+            const owner = context.repo.owner;
+            const self = `${owner}/${context.repo.repo}`;
+
+            const g = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const overrides = (g.manualOverrides && g.manualOverrides.downstreamConsumers) || [];
+
+            const found = new Set();
+            const configured = ${{ toJSON(vars.PARTNER_REPO) }};
+            if (configured) found.add(configured);
+
+            try {
+              const q = `"${artifactId}" in:file filename:pom.xml`;
+              const res = await github.rest.search.code({ q, per_page: 100 });
+              for (const it of res.data.items) found.add(it.repository.full_name);
+            } catch (e) { core.warning(`Code Search unavailable: ${e.message}`); }
+
+            const re = new RegExp(`${groupId}[\\s\\S]{0,80}${artifactId}|<artifactId>\\s*${artifactId}\\s*</artifactId>`);
+            const confirmed = [];
+            for (const full of found) {
+              if (full === self) continue;
+              const [o, r] = full.split('/');
+              try {
+                const pom = await github.rest.repos.getContent({ owner: o, repo: r, path: 'pom.xml' });
+                const text = Buffer.from(pom.data.content, 'base64').toString('utf8');
+                if (re.test(text)) confirmed.push(full);
+              } catch (e) { core.info(`Skip ${full}: ${e.message}`); }
+            }
+
+            // Preserve overrides, store confirmed as bare names when owned by us.
+            const bare = f => f.startsWith(owner + '/') ? f.slice(owner.length + 1) : f;
+            g.downstreamConsumers = [...new Set(confirmed.map(bare))].sort();
+            g.manualOverrides.downstreamConsumers = overrides;
+            fs.writeFileSync(path, JSON.stringify(g, null, 2) + '\n');
+            core.info(`downstreamConsumers = ${JSON.stringify(g.downstreamConsumers)}`);
+
+      - name: Open PR if the graph changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          branch: chore/service-graph
+          commit-message: "chore: regenerate service graph"
+          title: "chore: regenerate service graph"
+          body: |
+            Automated Tier-3 service-graph regeneration.
+
+            `downstreamConsumers` rebuilt from confirmed Code Search results.
+            `manualOverrides` preserved. Review before merging.
+          add-paths: .github/service-graph.json
+          delete-branch: true

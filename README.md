@@ -139,17 +139,23 @@ Production design uses a **GitHub App** installed on both repos. A fine-grained
 
 ## Dependency discovery (and its limits)
 
-Discovery is **automated** but **not authoritative**:
+Discovery is **automated** but **not authoritative**. Three tiers, in priority order:
 
-- GitHub **dependency graph** can identify supported Maven relationships.
-- GitHub **Code Search** finds Maven coordinates / Stub Runner ids, but is
-  text-based, may have indexing delay, and is not guaranteed complete.
-- HTTP calls, Kafka topics, runtime, dynamically-constructed, and test-only
-  relationships may not appear.
-- Every candidate is confirmed by reading its `pom.xml`; `PARTNER_REPO` gives a
-  deterministic fallback.
-- Production likely needs a **generated typed service graph** with a small,
-  audited manual override for relationships that cannot be inferred.
+1. **Service graph (Tier-3, preferred)** — `.github/service-graph.json`, an
+   audited, machine-generated edge list read *first* by the `discover` job.
+   `downstreamConsumers` is regenerated nightly by
+   `.github/workflows/service-graph-generator.yml` from confirmed Code Search;
+   `manualOverrides.downstreamConsumers` is preserved for relationships that
+   cannot be inferred (e.g. runtime HTTP/Kafka). Entries may be bare repo names
+   (owner inferred) or full `owner/name`.
+2. **`PARTNER_REPO`** — deterministic fallback when the graph/search is cold.
+3. **GitHub Code Search / dependency graph** — supplements the above; text-based,
+   may have indexing delay, not guaranteed complete. HTTP/Kafka/runtime,
+   dynamically-constructed, and test-only relationships may not appear.
+
+Every candidate from any tier is **confirmed** by reading its `pom.xml` before it
+enters the verification matrix. The generator opens a PR (never a silent push to
+`main`) so graph changes are reviewed.
 
 ## Security model / limitations
 

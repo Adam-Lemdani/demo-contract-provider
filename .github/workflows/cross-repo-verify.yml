@@ -80,14 +80,27 @@ jobs:
         with:
           github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
           script: |
+            const fs = require('fs');
             const groupId = ${{ toJSON(steps.ctx.outputs.group_id) }};
             const artifactId = ${{ toJSON(steps.ctx.outputs.artifact_id) }};
 
             const candidates = new Set();
+            const owner = context.repo.owner;
+            // Normalise bare repo names to owner/name using THIS repo's owner.
+            const norm = r => r.includes('/') ? r : `${owner}/${r}`;
+
+            // Tier-3 (preferred): authoritative, audited service graph.
+            try {
+              const g = JSON.parse(fs.readFileSync('.github/service-graph.json', 'utf8'));
+              for (const r of (g.downstreamConsumers || [])) candidates.add(norm(r));
+              for (const r of ((g.manualOverrides || {}).downstreamConsumers || [])) candidates.add(norm(r));
+              core.info(`Service graph consumers: ${[...candidates].join(', ') || '(none)'}`);
+            } catch (e) { core.info(`No service graph (${e.message}); relying on search + PARTNER_REPO.`); }
+
             const manual = ${{ toJSON(github.event.inputs.consumer_repo) }};
-            if (manual) candidates.add(manual);
+            if (manual) candidates.add(norm(manual));
             const configured = ${{ toJSON(vars.PARTNER_REPO) }};
-            if (configured) candidates.add(configured);
+            if (configured) candidates.add(norm(configured));
 
             // Downstream discovery: who references our coordinates in a pom.xml.
             // Code Search is text-based, may lag indexing, and is NOT authoritative.
