@@ -15,7 +15,7 @@ Contract.make {
     description "should return a greeting for the given name"
     request {
         method GET()
-        url "/api/greetings/Adam"
+        url "/api/greetings/Team"
     }
     response {
         status OK()
