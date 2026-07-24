@@ -1,0 +1,128 @@
+name: Dispatch to consumers (provider PR)
+
+# When a provider PR is opened/updated, discover repositories that consume this
+# provider's stubs and ask each of them to verify the EXACT provider PR commit.
+#
+# This workflow only DISPATCHES. A repository_dispatch event triggers a workflow
+# on the target repo; it does not build or test anything itself. The real work
+# happens in the consumer's "Verify against provider" receiver workflow.
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      consumer_repo:
+        description: 'owner/name of a consumer repo to target (manual fallback)'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dispatch-consumers-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover-and-dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Never expose credentials to untrusted fork PRs.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read provider Maven coordinates from pom.xml
+        id: coords
+        run: |
+          GID=$(mvn -q -N -Dexec.executable=echo -Dexec.args='${project.groupId}' org.codehaus.mojo:exec-maven-plugin:3.1.0:exec 2>/dev/null | tail -1)
+          AID=$(mvn -q -N -Dexec.executable=echo -Dexec.args='${project.artifactId}' org.codehaus.mojo:exec-maven-plugin:3.1.0:exec 2>/dev/null | tail -1)
+          VER=$(mvn -q -N -Dexec.executable=echo -Dexec.args='${project.version}' org.codehaus.mojo:exec-maven-plugin:3.1.0:exec 2>/dev/null | tail -1)
+          echo "group_id=$GID"    >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$AID" >> "$GITHUB_OUTPUT"
+          echo "version=$VER"     >> "$GITHUB_OUTPUT"
+          echo "Provider coordinates: $GID:$AID:$VER"
+
+      # Production design: authenticate as a GitHub App installed on both repos.
+      - name: Generate GitHub App token
+        id: app-token
+        if: vars.APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Discover consumers and dispatch verification
+        uses: actions/github-script@v7
+        with:
+          # Prefer App token; fall back to a fine-grained PAT for demo only.
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
+          script: |
+            const groupId = ${{ toJSON(steps.coords.outputs.group_id) }};
+            const artifactId = ${{ toJSON(steps.coords.outputs.artifact_id) }};
+            const providerSha = context.payload.pull_request
+              ? context.payload.pull_request.head.sha
+              : context.sha;
+            const prNumber = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : 0;
+
+            // 1) Candidate discovery. Automated, but NOT authoritative:
+            //    Code Search is text-based, may lag indexing, and can miss
+            //    runtime-only (HTTP/Kafka) relationships. Results are candidates.
+            const candidates = new Set();
+
+            const manual = ${{ toJSON(github.event.inputs.consumer_repo) }};
+            if (manual) candidates.add(manual);
+
+            const configured = ${{ toJSON(vars.PARTNER_REPO) }};
+            if (configured) candidates.add(configured);
+
+            try {
+              const q = `"${groupId}:${artifactId}" in:file filename:pom.xml`;
+              const res = await github.rest.search.code({ q, per_page: 50 });
+              for (const item of res.data.items) {
+                candidates.add(item.repository.full_name);
+              }
+            } catch (e) {
+              core.warning(`Code Search failed or unavailable: ${e.message}`);
+            }
+
+            core.info(`Candidate consumers: ${[...candidates].join(', ') || '(none)'}`);
+
+            // 2) Confirm each candidate by reading its manifest for the coordinates.
+            const coordRe = new RegExp(`${groupId}[:</>\\s]+${artifactId}`);
+            const confirmed = [];
+            for (const full of candidates) {
+              const [owner, repo] = full.split('/');
+              if (!owner || !repo) continue;
+              try {
+                const pom = await github.rest.repos.getContent({ owner, repo, path: 'pom.xml' });
+                const text = Buffer.from(pom.data.content, 'base64').toString('utf8');
+                if (coordRe.test(text)) confirmed.push(full);
+                else core.info(`Skipping ${full}: coordinates not found in pom.xml`);
+              } catch (e) {
+                core.info(`Skipping ${full}: cannot read pom.xml (${e.message})`);
+              }
+            }
+
+            if (confirmed.length === 0) {
+              core.warning('No confirmed consumers. Nothing to dispatch.');
+              return;
+            }
+
+            // 3) Dispatch verification to each confirmed consumer.
+            for (const full of confirmed) {
+              const [owner, repo] = full.split('/');
+              core.info(`Dispatching verify-provider-change to ${full} @ ${providerSha}`);
+              await github.rest.repos.createDispatchEvent({
+                owner, repo,
+                event_type: 'verify-provider-change',
+                client_payload: {
+                  provider_repo: context.repo.owner + '/' + context.repo.repo,
+                  provider_sha: providerSha,
+                  provider_pr: prNumber,
+                },
+              });
+            }

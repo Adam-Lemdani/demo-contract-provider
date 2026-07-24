@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.4.1</version>
+        <relativePath/>
+    </parent>
+
+    <!--
+      These coordinates are the "contract" between provider and consumer.
+      The consumer references them as Stub Runner IDs:
+          com.example.demo:demo-contract-provider:1.0.0-SNAPSHOT:stubs
+      The version is intentionally STATIC across the demo. We never bump it
+      per-PR; cross-repo verification always builds from an exact commit SHA
+      and installs into a runner-local .m2 (see .github/workflows).
+    -->
+    <groupId>com.example.demo</groupId>
+    <artifactId>demo-contract-provider</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <name>demo-contract-provider</name>
+    <description>Spring Cloud Contract provider demo (Groovy DSL contracts + stub generation)</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <spring-cloud.version>2024.0.0</spring-cloud.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Producer-side contract verification: generates tests from the Groovy contracts. -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-contract-verifier</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!--
+              Spring Cloud Contract Maven plugin:
+                * generateTests  -> produces JUnit5 tests from src/test/resources/contracts (Groovy DSL)
+                * generateStubs  -> produces the *-stubs.jar
+              On `mvn install` the stubs jar is installed ONLY into the local .m2 of
+              whatever machine/runner is building. Nothing is published remotely.
+            -->
+            <plugin>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-contract-maven-plugin</artifactId>
+                <version>4.2.0</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <testFramework>JUNIT5</testFramework>
+                    <baseClassForTests>com.example.provider.contract.ContractVerifierBase</baseClassForTests>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

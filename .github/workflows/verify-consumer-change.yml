@@ -1,0 +1,143 @@
+name: Verify consumer change (receiver)
+
+# Provider-side receiver for the CONSUMER PR flow.
+#
+# A consumer PR dispatches 'verify-consumer-change' here. We build the PROVIDER
+# (default branch) and its stubs into this job's runner-local .m2, then run the
+# CHANGED CONSUMER's tests (checked out at the exact consumer PR SHA) against
+# those local stubs. We then report pass/fail back onto the consumer PR.
+#
+# NOTE: installing the consumer application jar and running the provider build
+# would NOT verify consumer behaviour. We explicitly run the consumer's tests
+# against the provider contract/stubs.
+
+on:
+  repository_dispatch:
+    types: [ verify-consumer-change ]
+  workflow_dispatch:
+    inputs:
+      consumer_repo:
+        description: 'owner/name of the consumer repo'
+        required: true
+      consumer_sha:
+        description: 'exact consumer commit SHA to verify'
+        required: true
+      consumer_pr:
+        description: 'consumer PR number to report on (0 for none)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-consumer-${{ github.event.client_payload.consumer_repo || github.event.inputs.consumer_repo }}-${{ github.event.client_payload.consumer_sha || github.event.inputs.consumer_sha }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate and normalise payload
+        id: in
+        env:
+          C_REPO: ${{ github.event.client_payload.consumer_repo || github.event.inputs.consumer_repo }}
+          C_SHA: ${{ github.event.client_payload.consumer_sha || github.event.inputs.consumer_sha }}
+          C_PR: ${{ github.event.client_payload.consumer_pr || github.event.inputs.consumer_pr || '0' }}
+        run: |
+          set -euo pipefail
+          # Prevent arbitrary repository / command injection from the payload.
+          [[ "$C_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "Bad repo: $C_REPO"; exit 1; }
+          [[ "$C_SHA"  =~ ^[0-9a-f]{40}$ ]]                     || { echo "Bad sha: $C_SHA"; exit 1; }
+          [[ "$C_PR"   =~ ^[0-9]+$ ]]                           || { echo "Bad pr: $C_PR"; exit 1; }
+          echo "consumer_repo=$C_REPO" >> "$GITHUB_OUTPUT"
+          echo "consumer_sha=$C_SHA"   >> "$GITHUB_OUTPUT"
+          echo "consumer_pr=$C_PR"     >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: vars.APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            ${{ steps.in.outputs.consumer_repo }}
+
+      - name: Report pending status on consumer PR
+        if: steps.in.outputs.consumer_pr != '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
+          script: |
+            const [owner, repo] = ${{ toJSON(steps.in.outputs.consumer_repo) }}.split('/');
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: ${{ toJSON(steps.in.outputs.consumer_sha) }},
+              state: 'pending', context: 'contract-verification/provider',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Running consumer tests against provider stubs',
+            });
+
+      # --- Both repositories are checked out into ONE job (constraint) ---
+      - name: Checkout provider (default branch)
+        uses: actions/checkout@v4
+        with:
+          path: provider
+
+      - name: Checkout consumer at exact PR SHA
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.in.outputs.consumer_repo }}
+          ref: ${{ steps.in.outputs.consumer_sha }}
+          path: consumer
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install provider + stubs into runner-local .m2
+        id: build
+        run: |
+          set -euo pipefail
+          M2="${{ runner.temp }}/m2"
+          # 1) Provider stubs -> runner-local .m2 (never published remotely).
+          mvn -B -ntp -f provider/pom.xml clean install -Dmaven.repo.local="$M2"
+          PVER=$(mvn -q -N -f provider/pom.xml -Dexec.executable=echo -Dexec.args='${project.version}' org.codehaus.mojo:exec-maven-plugin:3.1.0:exec | tail -1)
+          # 2) Run the CHANGED consumer's tests against those local stubs.
+          mvn -B -ntp -f consumer/pom.xml test \
+            -Dmaven.repo.local="$M2" \
+            -Dprovider.stubs.version="$PVER"
+
+      - name: Report result on consumer PR
+        if: always() && steps.in.outputs.consumer_pr != '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
+          script: |
+            const success = ${{ steps.build.outcome == 'success' }};
+            const [owner, repo] = ${{ toJSON(steps.in.outputs.consumer_repo) }}.split('/');
+            const sha = ${{ toJSON(steps.in.outputs.consumer_sha) }};
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              state: success ? 'success' : 'failure',
+              context: 'contract-verification/provider',
+              target_url: runUrl,
+              description: success ? 'Consumer tests pass against provider stubs'
+                                   : 'Consumer tests FAIL against provider stubs',
+            });
+
+            // Update a single summary comment instead of spamming the PR.
+            const pr = Number(${{ toJSON(steps.in.outputs.consumer_pr) }});
+            const marker = '<!-- contract-verification:provider -->';
+            const body = `${marker}\n### Contract verification (provider ${context.repo.owner}/${context.repo.repo})\n` +
+              `${success ? '✅ Consumer tests **pass** against the provider stubs.' : '❌ Consumer tests **fail** against the provider stubs.'}\n\n` +
+              `Commit \`${sha.substring(0,7)}\` · [Actions run](${runUrl})`;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number: pr });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });

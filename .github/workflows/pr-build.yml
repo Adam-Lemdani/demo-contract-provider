@@ -1,0 +1,35 @@
+name: PR Build (provider)
+
+# Normal per-PR build. Compiles the provider, generates the contract tests from
+# the Groovy DSL, verifies them, and installs the stubs jar into THIS job's
+# runner-local .m2. Nothing is published to any remote repository.
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-build-provider-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build, verify contracts, install stubs to runner-local .m2
+        run: |
+          mvn -B -ntp clean install \
+            -Dmaven.repo.local="${{ runner.temp }}/m2"
