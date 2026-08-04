@@ -23,7 +23,7 @@ class GreetingControllerTest {
     void returnsGreetingMessage() throws Exception {
         mockMvc.perform(post("/api/greetings")
                         .contentType(APPLICATION_JSON)
-                        .content("{\"name\":\"Team\"}"))
+                        .content("{\"fullName\":\"Team\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("Hello Team"));
     }
