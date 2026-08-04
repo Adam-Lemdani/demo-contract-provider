@@ -6,8 +6,10 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 public class GreetingController {
+  
     @PostMapping("/api/greetings")
     public GreetingResponse greeting(@RequestBody GreetingRequest request) {
         return new GreetingResponse("Hello " + request.name());
     }
+
 }
