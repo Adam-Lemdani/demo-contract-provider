@@ -7,7 +7,7 @@ broker** and **no artifact publishing**.
 Endpoint:
 
 ```
-GET /api/greetings/{name}  ->  200 {"message":"Hello {name}"}
+POST /api/greetings {"name":"Team"}  ->  200 {"message":"Hello Team"}
 ```
 
 - Java 21, Maven, Spring Boot 3.4.1, Spring Cloud 2024.0.0 (Contract 4.2.0).
@@ -19,10 +19,11 @@ GET /api/greetings/{name}  ->  200 {"message":"Hello {name}"}
 ## What the demo proves / does not prove
 
 **Proves:** When a provider PR changes the contract-relevant behaviour (e.g.
-renames the `message` field), an automated GitHub Actions flow builds the exact
-PR commit and runs the **real consumer tests** against the resulting stubs,
-reporting pass/fail back on the PR - with no developer-run Maven commands after
-the PR is raised, and no artifacts published anywhere.
+renames the JSON request field or the `message` response field), an automated
+GitHub Actions flow builds the exact PR commit and runs the **real consumer
+tests** against the resulting stubs, reporting pass/fail back on the PR - with
+no developer-run Maven commands after the PR is raised, and no artifacts
+published anywhere.
 
 **Does not prove:** That every consumer everywhere is discovered (discovery is
 best-effort - see below), nor that runtime concerns beyond the contract (auth,
@@ -82,11 +83,14 @@ mvn clean install -Dmaven.repo.local=/tmp/m2
 
 Rename the contract-relevant field and watch consumer verification fail:
 
-1. In `src/main/java/com/example/provider/Greeting.java` rename `message` → `content`.
-2. In `src/test/resources/contracts/greetings/shouldReturnGreeting.groovy` change
-   `message:` → `content:` and update the provider's own tests.
-3. `mvn clean install` - stubs now emit `{"content":...}`.
-4. The consumer's `GreetingClientStubRunnerTest` (which expects `message`) fails.
+1. In `src/main/java/com/example/provider/GreetingResponse.java` rename
+   `message` → `text`.
+2. In `src/test/resources/contracts/greetings/shouldReturnGreeting.groovy`
+   change `message:` → `text:` and update the provider's own tests.
+3. `mvn clean install` - stubs now emit `{"text":...}` while the consumer still
+   expects `{"message":...}`.
+4. The consumer's `GreetingClientStubRunnerTest` fails until the consumer client
+   and DTOs are updated to match.
 
 Restore the field to return to green.
 
@@ -220,4 +224,3 @@ enters the verification matrix. The generator opens a PR (never a silent push to
   on the target repo.
 - **No status on PR**: `Commit statuses: write` missing, or the reporting token
   can't see the originating repo.
-

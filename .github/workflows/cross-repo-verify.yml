@@ -146,6 +146,45 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
+      # Coordinated cross-repo changes: if this PR's branch carries a Jira ticket
+      # (e.g. SIPP2-30) and the partner repo has a branch containing the SAME
+      # ticket, verify against THAT branch instead of the partner's default
+      # branch. This lets a provider PR and its matching consumer fix verify
+      # against each other. Ambiguity (>1 matching branch) fails deliberately —
+      # one ticket must map to one branch per repo.
+      - name: Resolve consumer ref (ticket-matched branch or default)
+        id: partner
+        uses: actions/github-script@v7
+        env:
+          PARTNER: ${{ matrix.consumer }}
+          HEAD_REF: ${{ github.head_ref }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
+          script: |
+            const partner = process.env.PARTNER;
+            const headRef = process.env.HEAD_REF || '';
+            const [owner, repo] = partner.split('/');
+            const meta = await github.rest.repos.get({ owner, repo });
+            let ref = meta.data.default_branch;
+            let matched = '';
+            const tickets = [...new Set((headRef.match(/[A-Z][A-Z0-9]+-\d+/g) || []))];
+            if (tickets.length === 1) {
+              const ticket = tickets[0];
+              const branches = await github.paginate(github.rest.repos.listBranches, { owner, repo, per_page: 100 });
+              const hits = branches.filter(b => b.name.toUpperCase().includes(ticket));
+              if (hits.length > 1) {
+                core.setFailed(`Ambiguous: ticket ${ticket} matches ${hits.length} branches in ${partner} `
+                  + `(${hits.map(h => h.name).join(', ')}). One ticket must map to one branch per repo.`);
+                return;
+              }
+              if (hits.length === 1) { ref = hits[0].name; matched = hits[0].name; }
+            } else if (tickets.length > 1) {
+              core.info(`Head branch has multiple tickets (${tickets.join(', ')}); using ${partner} default branch.`);
+            }
+            core.setOutput('ref', ref);
+            core.setOutput('matched', matched ? 'true' : 'false');
+            core.info(`Partner ${partner} -> ${ref}${matched ? ' (ticket-matched)' : ' (default branch)'}`);
+
       - name: Checkout provider at PR SHA
         uses: actions/checkout@v4
         with:
@@ -153,10 +192,11 @@ jobs:
           fetch-depth: 1
           path: provider
 
-      - name: Checkout consumer default branch
+      - name: Checkout consumer (ticket-matched branch or default)
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.consumer }}
+          ref: ${{ steps.partner.outputs.ref }}
           token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
           fetch-depth: 1
           path: consumer
@@ -173,7 +213,11 @@ jobs:
         run: |
           set -euo pipefail
           M2="${{ runner.temp }}/m2"
-          mvn -B -ntp -f provider/pom.xml clean install -Dmaven.repo.local="$M2"
+          # Dependency (provider) only needs its stub jar installed into the
+          # runner-local .m2 — NOT its full test suite. -DskipTests still runs
+          # package (which builds+attaches the stubs) but skips provider tests.
+          # The provider's own contract tests run in its pr-build.yml.
+          mvn -B -ntp -f provider/pom.xml clean install -DskipTests -Dmaven.repo.local="$M2"
           PVER=$(mvn -q -N -f provider/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)
           mvn -B -ntp -f consumer/pom.xml test -Dmaven.repo.local="$M2" -Dprovider.stubs.version="$PVER"
 
@@ -183,8 +227,9 @@ jobs:
           mkdir -p results
           SAFE=$(echo "${{ matrix.consumer }}" | tr '/' '_')
           RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          printf '{"repo":"%s","outcome":"%s","job_url":"%s"}\n' \
-            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" "$RUN/job/${{ github.job }}" > "results/$SAFE.json"
+          printf '{"repo":"%s","outcome":"%s","job_url":"%s","ref":"%s","matched":%s}\n' \
+            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" "$RUN/job/${{ github.job }}" \
+            "${{ steps.partner.outputs.ref }}" "${{ steps.partner.outputs.matched || 'false' }}" > "results/$SAFE.json"
 
       - name: Upload result
         if: always()
@@ -251,7 +296,8 @@ jobs:
             if (!context.payload.pull_request) return;
 
             const marker = '<!-- contract-verification:downstream -->';
-            const line = r => `- ${r.outcome === 'success' ? '✅' : '❌'} \`${r.repo}\` ([job](${r.job_url}))`;
+            const refOf = r => r.matched ? ` — matched branch \`${r.ref}\`` : (r.ref ? ` — \`${r.ref}\`` : '');
+            const line = r => `- ${r.outcome === 'success' ? '✅' : '❌'} \`${r.repo}\`${refOf(r)} ([job](${r.job_url}))`;
             let body = `${marker}\n### Contract verification — downstream consumers\n`;
             if (noConsumers) {
               body += `No downstream consumers reference this provider. Nothing to verify.\n`;
