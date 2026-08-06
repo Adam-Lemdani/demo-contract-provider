@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, java-runner-scale-set-canary]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

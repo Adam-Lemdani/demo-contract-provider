@@ -11,7 +11,7 @@ Contract.make {
             contentType(applicationJson())
         }
         body(
-                name: "Team"
+                fullName: "Team"
         )
     }
     response {
