@@ -210,7 +210,6 @@ jobs:
 
       - name: Build provider stubs (runner-local .m2) + run consumer tests
         id: run
-        continue-on-error: true
         run: |
           set -euo pipefail
           M2="${{ runner.temp }}/m2"
