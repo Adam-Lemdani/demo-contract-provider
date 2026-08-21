@@ -201,7 +201,7 @@ Discovery is **automated** but **not authoritative**. Three tiers, in priority o
 
 Every candidate from any tier is **confirmed** by reading its `pom.xml` before it
 enters the verification matrix. The generator opens a PR (never a silent push to
-`main`) so graph changes are reviewed.
+`main`) so graph changes are reviewed.  
 
 ## Security model / limitations
 
