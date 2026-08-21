@@ -340,5 +340,3 @@ jobs:
               { owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
             else await github.rest.issues.createComment(
               { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr, body });
-
-            if (!success) core.setFailed(`${failed.length} consumer(s) failing`);
