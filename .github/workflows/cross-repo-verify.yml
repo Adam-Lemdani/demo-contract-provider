@@ -226,9 +226,8 @@ jobs:
         run: |
           mkdir -p results
           SAFE=$(echo "${{ matrix.consumer }}" | tr '/' '_')
-          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          printf '{"repo":"%s","outcome":"%s","run_url":"%s","ref":"%s","matched":%s}\n' \
-            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" "$RUN" \
+          printf '{"repo":"%s","outcome":"%s","ref":"%s","matched":%s}\n' \
+            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" \
             "${{ steps.partner.outputs.ref }}" "${{ steps.partner.outputs.matched || 'false' }}" > "results/$SAFE.json"
 
       - name: Upload result
