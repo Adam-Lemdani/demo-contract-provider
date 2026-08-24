@@ -24,6 +24,7 @@ on:
         required: false
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
   statuses: write
@@ -78,7 +79,7 @@ jobs:
         id: find
         uses: actions/github-script@v7
         with:
-          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT }}
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const groupId = ${{ toJSON(steps.ctx.outputs.group_id) }};
@@ -159,7 +160,7 @@ jobs:
           PARTNER: ${{ matrix.consumer }}
           HEAD_REF: ${{ github.head_ref }}
         with:
-          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || secrets.GITHUB_TOKEN }}
           script: |
             const partner = process.env.PARTNER;
             const headRef = process.env.HEAD_REF || '';
@@ -209,7 +210,6 @@ jobs:
 
       - name: Build provider stubs (runner-local .m2) + run consumer tests
         id: run
-        continue-on-error: true
         run: |
           set -euo pipefail
           M2="${{ runner.temp }}/m2"
@@ -226,9 +226,8 @@ jobs:
         run: |
           mkdir -p results
           SAFE=$(echo "${{ matrix.consumer }}" | tr '/' '_')
-          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          printf '{"repo":"%s","outcome":"%s","job_url":"%s","ref":"%s","matched":%s}\n' \
-            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" "$RUN/job/${{ github.job }}" \
+          printf '{"repo":"%s","outcome":"%s","ref":"%s","matched":%s}\n' \
+            "${{ matrix.consumer }}" "${{ steps.run.outcome }}" \
             "${{ steps.partner.outputs.ref }}" "${{ steps.partner.outputs.matched || 'false' }}" > "results/$SAFE.json"
 
       - name: Upload result
@@ -265,7 +264,7 @@ jobs:
       - name: Aggregate + report on PR
         uses: actions/github-script@v7
         with:
-          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || github.token }}
+          github-token: ${{ steps.app-token.outputs.token || secrets.DISPATCH_PAT || secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const sha = ${{ toJSON(needs.discover.outputs.provider_sha) }};
@@ -282,6 +281,26 @@ jobs:
             const passed = results.filter(r => r.outcome === 'success');
             const noConsumers = results.length === 0;
             const success = failed.length === 0;
+            const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              per_page: 100,
+            });
+            const matrixJobs = new Map(jobs.jobs.map(job => [job.name, job]));
+            const jobUrlFor = r => {
+              const job = matrixJobs.get(`verify (${r.repo})`);
+              if (!job || !job.html_url) {
+                core.warning(`Could not find matrix job for ${r.repo}; linking to the workflow run.`);
+                return runUrl;
+              }
+              if (r.outcome !== 'success') {
+                const failedStep = (job.steps || []).find(step =>
+                  ['failure', 'timed_out'].includes(step.conclusion));
+                if (failedStep) return `${job.html_url}#step:${failedStep.number}:1`;
+              }
+              return job.html_url;
+            };
 
             // Single aggregated status for branch protection.
             await github.rest.repos.createCommitStatus({
@@ -297,7 +316,7 @@ jobs:
 
             const marker = '<!-- contract-verification:downstream -->';
             const refOf = r => r.matched ? ` — matched branch \`${r.ref}\`` : (r.ref ? ` — \`${r.ref}\`` : '');
-            const line = r => `- ${r.outcome === 'success' ? '✅' : '❌'} \`${r.repo}\`${refOf(r)} ([job](${r.job_url}))`;
+            const line = r => `- ${r.outcome === 'success' ? '✅' : '❌'} \`${r.repo}\`${refOf(r)} ([job](${jobUrlFor(r)}))`;
             let body = `${marker}\n### Contract verification — downstream consumers\n`;
             if (noConsumers) {
               body += `No downstream consumers reference this provider. Nothing to verify.\n`;
@@ -320,5 +339,3 @@ jobs:
               { owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
             else await github.rest.issues.createComment(
               { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr, body });
-
-            if (!success) core.setFailed(`${failed.length} consumer(s) failing`);

@@ -3,7 +3,8 @@
   "service": "demo-contract-provider",
   "coordinates": "com.example.demo:demo-contract-provider",
   "downstreamConsumers": [
-    "demo-contract-consumer"
+    "demo-contract-consumer",
+    "demo-contract-consumer2"
   ],
   "upstreamProviders": [],
   "manualOverrides": {
